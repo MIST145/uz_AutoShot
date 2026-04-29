@@ -1,12 +1,10 @@
-const http = require('http');
 const path = require('path');
 const fs   = require('fs');
 const { PNG } = require('pngjs');
 
-const PORT       = 3959;
 const RESOURCE   = GetCurrentResourceName();
 const RES_PATH   = GetResourcePath(RESOURCE);
-const OUTPUT_DIR = path.join(RES_PATH, 'shots');
+const OUTPUT_DIR = path.resolve(path.join(RES_PATH, 'shots'));
 
 try {
     if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
@@ -14,117 +12,20 @@ try {
     console.log('^1[uz_AutoShot]^0 Output dir error: ' + err.message);
 }
 
-let manifestCache = null;
-function buildItems() {
-    const items = [];
-    if (!fs.existsSync(OUTPUT_DIR)) return items;
-
-    function walkDir(dir, rel) {
-        let entries;
-        try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-        for (const entry of entries) {
-            const entryRel = rel ? rel + '/' + entry.name : entry.name;
-            if (entry.isDirectory()) {
-                walkDir(path.join(dir, entry.name), entryRel);
-            } else if (/\.(png|webp|jpg)$/.test(entry.name)) {
-                const parts = entryRel.replace(/\.(png|webp|jpg)$/, '').split('/');
-                if (parts.length === 2 && (parts[0] === 'vehicles' || parts[0] === 'objects')) {
-                    const modelName = parts[1];
-                    items.push({
-                        url:      'https://cfx-nui-' + RESOURCE + '/shots/' + entryRel,
-                        file:     entryRel,
-                        gender:   'unisex',
-                        type:     parts[0] === 'vehicles' ? 'vehicle' : 'object',
-                        id:       0,
-                        drawable: 0,
-                        texture:  0,
-                        model:    modelName,
-                    });
-                } else if (parts.length >= 3) {
-                    const gender    = parts[0];
-                    const catPart   = parts[1];
-                    const drawPart  = parts[2];
-                    const isProp    = catPart.startsWith('prop_');
-                    const isOverlay = catPart.startsWith('overlay_');
-                    const itemType  = isOverlay ? 'overlay' : (isProp ? 'prop' : 'component');
-                    const catId     = isOverlay ? parseInt(catPart.replace('overlay_', ''))
-                                   : isProp    ? parseInt(catPart.replace('prop_', ''))
-                                   :             parseInt(catPart);
-                    const drawParts = drawPart.split('_');
-                    items.push({
-                        url:      'https://cfx-nui-' + RESOURCE + '/shots/' + entryRel,
-                        file:     entryRel,
-                        gender:   gender,
-                        type:     itemType,
-                        id:       catId || 0,
-                        drawable: parseInt(drawParts[0]) || 0,
-                        texture:  isOverlay ? 0 : (parseInt(drawParts[1]) || 0),
-                    });
-                }
-            }
-        }
-    }
-
-    walkDir(OUTPUT_DIR, '');
-    return items;
+function stripDataUri(b64) {
+    if (typeof b64 !== 'string') return b64;
+    if (!b64.startsWith('data:')) return b64;
+    const comma = b64.indexOf(',');
+    return comma === -1 ? b64 : b64.slice(comma + 1);
 }
 
-function getManifest() {
-    if (!manifestCache) {
-        const items = buildItems();
-        manifestCache = { generatedAt: Date.now(), total: items.length, items };
-    }
-    return manifestCache;
-}
+const ACE_RESTRICTED = GetConvar('uz_autoshot_ace_restricted', 'false') === 'true';
+const ACE_COMMAND    = GetConvar('uz_autoshot_command', 'shotmaker');
+const ACE_NAME       = 'command.' + ACE_COMMAND;
 
-function parseMultipart(body, boundary) {
-    const boundaryBuf = Buffer.from('--' + boundary);
-    const crlf        = Buffer.from('\r\n');
-    const headerEnd   = Buffer.from('\r\n\r\n');
-
-    // Find boundary positions
-    let start = indexOf(body, boundaryBuf, 0);
-    if (start === -1) return null;
-
-    // Skip header after first boundary
-    const headStart = start + boundaryBuf.length + crlf.length;
-    const headEnd   = indexOf(body, headerEnd, headStart);
-    if (headEnd === -1) return null;
-
-    // File data start
-    const dataStart = headEnd + headerEnd.length;
-
-    // Find next boundary -> file data end
-    const nextBoundary = indexOf(body, boundaryBuf, dataStart);
-    if (nextBoundary === -1) return null;
-
-    // Strip trailing \r\n
-    const dataEnd = nextBoundary - crlf.length;
-
-    // Try to extract filename from header
-    const headerStr = body.slice(headStart, headEnd).toString('utf-8');
-    let filename = 'upload';
-    const fnMatch = headerStr.match(/filename="([^"]+)"/);
-    if (fnMatch) filename = fnMatch[1];
-
-    return {
-        data: body.slice(dataStart, dataEnd),
-        filename,
-    };
-}
-
-function indexOf(buf, pattern, offset) {
-    for (let i = offset; i <= buf.length - pattern.length; i++) {
-        let found = true;
-        for (let j = 0; j < pattern.length; j++) {
-            if (buf[i + j] !== pattern[j]) {
-                found = false;
-                break;
-            }
-        }
-        if (found) return i;
-    }
-    return -1;
+function checkAce(src) {
+    if (!ACE_RESTRICTED) return true;
+    return IsPlayerAceAllowed(src.toString(), ACE_NAME);
 }
 
 function removeChromaKey(pngBuffer, mode) {
@@ -337,214 +238,103 @@ function resizePNG(pngBuffer, targetW, targetH) {
     return PNG.sync.write(dst, { colorType: 6 });
 }
 
-const server = http.createServer((req, res) => {
-    // CORS headers
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Headers', '*');
+const MAX_PAYLOAD_BYTES = 20 * 1024 * 1024;
 
-    if (req.method === 'OPTIONS') {
-        res.writeHead(200);
-        res.end();
+onNet('uz_autoshot:server:processCapture', (payload) => {
+    const src = source;
+    if (!checkAce(src)) {
+        console.log('^1[uz_AutoShot]^0 Refused capture: player ' + src + ' lacks ' + ACE_NAME);
+        return;
+    }
+    if (!payload || typeof payload !== 'object') return;
+
+    const xFilename  = typeof payload.filename === 'string' ? payload.filename : '';
+    const wantFormat = typeof payload.format === 'string' ? payload.format.toLowerCase() : 'png';
+    const wantTransp = payload.transparent === true || payload.transparent === '1' || payload.transparent === 1;
+    const chromaKey  = typeof payload.chromaKey === 'string' ? payload.chromaKey.toLowerCase() : 'green';
+    const wantWidth  = parseInt(payload.width)  || 0;
+    const wantHeight = parseInt(payload.height) || 0;
+    const imageData  = payload.imageData;
+
+    if (!xFilename || /[\\/]\.\.(?:[\\/]|$)/.test(xFilename) || path.isAbsolute(xFilename)) {
+        console.log('^1[uz_AutoShot]^0 Refused capture: invalid filename: ' + xFilename);
+        return;
+    }
+    if (typeof imageData !== 'string' || imageData.length === 0) {
+        console.log('^1[uz_AutoShot]^0 Refused capture: empty image data for ' + xFilename);
+        return;
+    }
+    if (imageData.length > Math.ceil(MAX_PAYLOAD_BYTES * 4 / 3) + 64) {
+        console.log('^1[uz_AutoShot]^0 Refused capture: payload too large for ' + xFilename);
         return;
     }
 
-    if (req.method === 'GET' && req.url.startsWith('/api/')) {
-        const rawPath  = req.url.split('?')[0];
-        const queryStr = req.url.includes('?') ? req.url.split('?')[1] : '';
-        const params   = {};
-        queryStr.split('&').forEach(p => {
-            const idx = p.indexOf('=');
-            if (idx > 0) params[decodeURIComponent(p.slice(0, idx))] = decodeURIComponent(p.slice(idx + 1));
-        });
-
-        const parts = rawPath.slice(5).split('/').filter(Boolean);
-        const route = parts[0];
-
-        res.setHeader('Content-Type', 'application/json');
-
-        if (route === 'stats') {
-            const manifest = getManifest();
-            const byGender = {}, byType = {};
-            for (const item of manifest.items) {
-                byGender[item.gender] = (byGender[item.gender] || 0) + 1;
-                byType[item.type]     = (byType[item.type]     || 0) + 1;
-            }
-            res.writeHead(200);
-            res.end(JSON.stringify({ total: manifest.total, byGender, byType }));
+    try {
+        let outputData = Buffer.from(stripDataUri(imageData), 'base64');
+        if (!outputData || outputData.length === 0) {
+            console.log('^1[uz_AutoShot]^0 Refused capture: invalid base64 for ' + xFilename);
             return;
         }
 
-        if (route === 'exists') {
-            const { gender, type, id, drawable, texture } = params;
-            const prefix = type === 'prop' ? 'prop_' : '';
-            const exts   = ['.png', '.webp', '.jpg'];
-            let found    = false;
-            for (const e of exts) {
-                const fp = path.join(OUTPUT_DIR, gender, prefix + id, drawable + '_' + texture + e);
-                if (fs.existsSync(fp)) { found = true; break; }
-            }
-            res.writeHead(200);
-            res.end(JSON.stringify({ exists: found }));
-            return;
-        }
+        let ext = wantFormat;
 
-        if (route === 'manifest') {
-            let items         = getManifest().items;
-            const filterGender = parts[1] || null;
-            const filterType   = parts[2] || null;
-            const filterId     = parts[3] !== undefined ? parseInt(parts[3]) : undefined;
-
-            if (filterGender)           items = items.filter(i => i.gender === filterGender);
-            if (filterType)             items = items.filter(i => i.type === filterType);
-            if (filterId !== undefined) items = items.filter(i => i.id === filterId);
-
-            res.writeHead(200);
-            res.end(JSON.stringify({ generatedAt: getManifest().generatedAt, total: items.length, items }));
-            return;
-        }
-
-        res.writeHead(404);
-        res.end(JSON.stringify({ error: 'Unknown API route' }));
-        return;
-    }
-
-    if (req.method === 'POST' && req.url === '/upload') {
-        const chunks = [];
-        let totalSize = 0;
-        const MAX_SIZE = 15 * 1024 * 1024;
-
-        req.on('data', (chunk) => {
-            totalSize += chunk.length;
-            if (totalSize > MAX_SIZE) {
-                res.writeHead(413, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'File too large' }));
-                req.destroy();
-                return;
-            }
-            chunks.push(chunk);
-        });
-
-        req.on('end', () => {
+        if (wantTransp) {
             try {
-                const body = Buffer.concat(chunks);
-
-                const contentType = req.headers['content-type'] || '';
-                const boundaryMatch = contentType.match(/boundary=(.+)/);
-
-                if (!boundaryMatch) {
-                    res.writeHead(400, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ error: 'No boundary found' }));
-                    return;
-                }
-
-                const boundary = boundaryMatch[1].trim();
-                const parsed = parseMultipart(body, boundary);
-
-                if (!parsed || !parsed.data || parsed.data.length === 0) {
-                    res.writeHead(400, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ error: 'No file data parsed' }));
-                    return;
-                }
-
-                const xFilename    = req.headers['x-filename'] || 'unknown';
-                const wantFormat   = req.headers['x-format'] || 'png';
-                const wantTransp   = req.headers['x-transparent'] === '1';
-                const chromaKey    = req.headers['x-chromakey'] || 'green';
-                const wantWidth    = parseInt(req.headers['x-width'])  || 0;
-                const wantHeight   = parseInt(req.headers['x-height']) || 0;
-
-                let outputData = parsed.data;
-                let ext = wantFormat;
-
-                if (wantTransp) {
-                    try {
-                        outputData = removeChromaKey(parsed.data, chromaKey);
-                        ext = 'png';
-                    } catch (e) {
-                        console.log('^3[uz_AutoShot]^0 Chroma key skipped: ' + e.message);
-                    }
-                }
-
-                if (wantWidth > 0 && wantHeight > 0 && ext === 'png') {
-                    const MAX_DIM = 4096;
-                    const clampedW = Math.min(Math.max(wantWidth, 16), MAX_DIM);
-                    const clampedH = Math.min(Math.max(wantHeight, 16), MAX_DIM);
-                    try {
-                        outputData = resizePNG(outputData, clampedW, clampedH);
-                    } catch (e) {
-                        console.log('^3[uz_AutoShot]^0 Resize skipped: ' + e.message);
-                    }
-                } else if (wantWidth > 0 && wantHeight > 0 && ext !== 'png') {
-                    console.log('^3[uz_AutoShot]^0 Resize requires PNG format; skipping for ' + ext);
-                }
-
-                const outputPath = path.join(OUTPUT_DIR, xFilename + '.' + ext);
-                const dir = path.dirname(outputPath);
-                if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-                fs.writeFileSync(outputPath, outputData);
-                manifestCache = null;
-
-                const sizeKB = Math.round(outputData.length / 1024);
-                const label = wantTransp ? 'bg removed' : ext;
-                console.log('^2[uz_AutoShot]^0 Saved: ' + xFilename + '.' + ext + ' (' + sizeKB + ' KB, ' + label + ')');
-
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: true, filename: xFilename + '.' + ext }));
-            } catch (err) {
-                console.log('^1[uz_AutoShot]^0 Process error: ' + err.message);
-                res.writeHead(500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: err.message }));
+                outputData = removeChromaKey(outputData, chromaKey);
+                ext = 'png';
+            } catch (e) {
+                console.log('^3[uz_AutoShot]^0 Chroma key skipped: ' + e.message);
             }
-        });
+        }
 
-        req.on('error', (err) => {
-            console.log('^1[uz_AutoShot]^0 Request error: ' + err.message);
-        });
+        if (wantWidth > 0 && wantHeight > 0 && ext === 'png') {
+            const MAX_DIM = 4096;
+            const clampedW = Math.min(Math.max(wantWidth, 16), MAX_DIM);
+            const clampedH = Math.min(Math.max(wantHeight, 16), MAX_DIM);
+            try {
+                outputData = resizePNG(outputData, clampedW, clampedH);
+            } catch (e) {
+                console.log('^3[uz_AutoShot]^0 Resize skipped: ' + e.message);
+            }
+        } else if (wantWidth > 0 && wantHeight > 0 && ext !== 'png') {
+            console.log('^3[uz_AutoShot]^0 Resize requires PNG format; skipping for ' + ext);
+        }
 
-        return;
+        const outputPath = path.resolve(path.join(OUTPUT_DIR, xFilename + '.' + ext));
+        if (!outputPath.startsWith(OUTPUT_DIR + path.sep)) {
+            console.log('^1[uz_AutoShot]^0 Refused capture: path traversal blocked for ' + xFilename);
+            return;
+        }
+
+        const dir = path.dirname(outputPath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(outputPath, outputData);
+
+        const sizeKB = Math.round(outputData.length / 1024);
+        const label = wantTransp ? 'bg removed' : ext;
+        console.log('^2[uz_AutoShot]^0 Saved: ' + xFilename + '.' + ext + ' (' + sizeKB + ' KB, ' + label + ')');
+    } catch (err) {
+        console.log('^1[uz_AutoShot]^0 Process error: ' + (err && err.message ? err.message : err));
     }
-
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not found' }));
-});
-
-server.on('error', (err) => {
-    console.log('^1[uz_AutoShot]^0 Server error: ' + err.message);
-});
-
-server.listen(PORT, '127.0.0.1', () => {
-    console.log('^2[uz_AutoShot]^0 Backend ready on http://127.0.0.1:' + PORT);
 });
 
 onNet('uz_autoshot:server:setBucket', (bucket) => {
     const src = source;
+    if (!checkAce(src)) {
+        console.log('^1[uz_AutoShot]^0 Refused setBucket: player ' + src + ' lacks ' + ACE_NAME);
+        return;
+    }
     SetPlayerRoutingBucket(src.toString(), bucket);
     console.log('^2[uz_AutoShot]^0 Player ' + src + ' -> bucket ' + bucket);
 });
 
 onNet('uz_autoshot:server:resetBucket', () => {
     const src = source;
+    if (!checkAce(src)) {
+        console.log('^1[uz_AutoShot]^0 Refused resetBucket: player ' + src + ' lacks ' + ACE_NAME);
+        return;
+    }
     SetPlayerRoutingBucket(src.toString(), 0);
     console.log('^2[uz_AutoShot]^0 Player ' + src + ' -> bucket 0');
-});
-
-onNet('uz_autoshot:server:getClothingData', () => {
-    const src = source;
-    try {
-        emitNet('uz_autoshot:client:receiveClothingData', src, getManifest().items);
-    } catch (err) {
-        console.log('^1[uz_AutoShot]^0 List error: ' + err.message);
-        emitNet('uz_autoshot:client:receiveClothingData', src, []);
-    }
-});
-
-on('uz_autoshot:getManifest', (gender) => {
-    try {
-        let items = getManifest().items;
-        if (gender) items = items.filter(i => i.gender === gender);
-        emit('uz_autoshot:manifestResult', { total: items.length, items });
-    } catch (err) {
-        emit('uz_autoshot:manifestResult', { total: 0, items: [] });
-    }
 });
 

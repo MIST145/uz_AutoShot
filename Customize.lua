@@ -12,8 +12,6 @@ Customize.TransparentBg     = true          -- chroma key removal (png only)
 Customize.ScreenshotWidth   = 512
 Customize.ScreenshotHeight  = 512
 
-Customize.BackendURL        = 'http://127.0.0.1:3959/upload'
-
 Customize.StudioCoords      = vector3(0.0, 0.0, -150.0)
 Customize.StudioHeading     = 180.0
 
@@ -26,6 +24,9 @@ Customize.CaptureAllTextures = false        -- true = all textures, false = text
 Customize.BatchSize         = 10
 Customize.BatchPauseWait    = 2000          -- ms
 Customize.GCInterval        = 20
+Customize.LatentRate        = 8000000       -- bytes/sec for capture upload (latent event throttle).
+                                            -- 8 MB/s is plenty for 512x512; raise for 4K source frames
+                                            -- (e.g. 16000000 = 16 MB/s) if uploads bottleneck the queue.
 
 -- Chroma Key Screen
 Customize.ChromaKeyColor    = 'magenta'          -- 'green' | 'magenta'
@@ -35,6 +36,24 @@ Customize.GreenScreen = {
     depth       = 8.0,
     height      = 8.5,
     floorOffset = -3.0,
+}
+
+-- Head Chroma Mask — covers the ped's head with chroma color so the server
+-- can wipe it out for accessory/torso shots (configured per category via
+-- the `hideHead = true` flag). Each entry is a sphere centered on SKEL_Head
+-- plus its own offsets, sized by sizeX/Y/Z, and optionally rotated by
+-- rotX/rotY/rotZ (degrees).
+--
+-- Stack multiple entries to cover head + jaw + neck independently — small
+-- spheres tucked exactly where they're needed beat one big sphere that has
+-- to compromise between clipping clothing or leaving skin visible.
+--
+-- Rotation is around the marker center. With unequal sizeX/Y/Z (ellipsoid)
+-- you can tilt the shape — e.g. rotX > 0 pitches the sphere's long axis
+-- downward, which is useful for following the slope of the neck under the
+-- chin without expanding into the chest area.
+Customize.HeadMask = {
+    { offsetX = 0.0, offsetY = 0.0, offsetZ = 0.136, sizeX = 0.12, sizeY = 0.15, sizeZ = 0.315 },
 }
 
 -- Auto-set screen color from preset (do not edit manually)

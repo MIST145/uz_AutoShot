@@ -13,6 +13,18 @@ local spawnedEntity     = nil
 local vehicleColor      = { primary = 0, secondary = 0 }
 local entitySpawnToken  = 0  -- increments each spawn request to cancel stale ones
 
+-- Orbit-camera state. Declared up here so functions defined earlier in the
+-- file (CreateCaptureCamera, ...) can read the live orbit values that the
+-- ORBIT CAMERA section below assigns.
+local orbitCam      = nil
+local orbitAngleH   = 0.0
+local orbitDist     = 1.2
+local orbitCenter   = vector3(0.0, 0.0, 0.0)
+local orbitFov      = 40.0
+local orbitBaseDist = 1.2
+local orbitRoll     = 0.0
+local orbitCamZ     = 0.0   -- camera Z offset (center stays fixed, camera moves up/down)
+
 local pedAppearance = {
     model = nil, coords = nil, heading = nil,
     components = {}, props = {},
@@ -125,30 +137,35 @@ local function CreateCaptureCamera(entity, preset, presetName)
         fov   = saved.fov or preset.fov
         lookZ = pedPos.z + zP
         roll  = saved.roll or 0.0
+    elseif preset.defaultAngleH then
+        -- Mirror the saved branch using the live orbit state. Reading
+        -- orbitAngleH/Dist/Fov here keeps "Start without saving" framed
+        -- exactly like the preview the user just left, instead of snapping
+        -- back to preset.defaultAngleH (which would 180-flip whenever the
+        -- user had rotated the orbit to face the ped).
+        local dist = (orbitDist > 0 and orbitDist) or preset.dist or 1.2
+        local aH   = orbitAngleH
+        local cZ   = orbitCamZ or preset.defaultCamZ or 0.0
+        camX  = pedPos.x + dist * math.sin(aH)
+        camY  = pedPos.y - dist * math.cos(aH)
+        camZ  = pedPos.z + preset.zPos + cZ
+        fov   = (orbitFov and orbitFov > 0) and orbitFov or preset.fov
+        lookZ = pedPos.z + preset.zPos
+        roll  = orbitRoll or preset.defaultRoll or 0.0
     else
-        local defaultCamZ = preset.defaultCamZ or 0.0
-        if preset.defaultAngleH then
-            local dist = preset.dist or 1.2
-            local aH = math.rad(preset.defaultAngleH)
-            camX  = pedPos.x + dist * math.sin(aH)
-            camY  = pedPos.y - dist * math.cos(aH)
-            camZ  = pedPos.z + preset.zPos + defaultCamZ
-            fov   = preset.fov
-            lookZ = pedPos.z + preset.zPos
-            roll  = preset.defaultRoll or 0.0
-        else
-            local rotZ = preset.rotation.z + captureRotOffset
-            SetEntityRotation(ped, preset.rotation.x, preset.rotation.y, rotZ, 2, false)
-            Wait(50)
-            local fwd = GetEntityForwardVector(ped)
-            local dist = preset.dist or 1.2
-            camX  = pedPos.x - fwd.x * dist
-            camY  = pedPos.y - fwd.y * dist
-            camZ  = pedPos.z - fwd.z + preset.zPos
-            fov   = preset.fov
-            lookZ = pedPos.z + preset.zPos
-            roll  = 0.0
-        end
+        -- Legacy preset without defaultAngleH: rotate ped to align with
+        -- camera, then place camera behind ped's forward vector.
+        local rotZ = preset.rotation.z + captureRotOffset
+        SetEntityRotation(ped, preset.rotation.x, preset.rotation.y, rotZ, 2, false)
+        Wait(50)
+        local fwd = GetEntityForwardVector(ped)
+        local dist = preset.dist or 1.2
+        camX  = pedPos.x - fwd.x * dist
+        camY  = pedPos.y - fwd.y * dist
+        camZ  = pedPos.z - fwd.z + preset.zPos
+        fov   = preset.fov
+        lookZ = pedPos.z + preset.zPos
+        roll  = 0.0
     end
 
     local cam = CreateCamWithParams('DEFAULT_SCRIPTED_CAMERA', camX, camY, camZ, 0.0, 0.0, 0.0, fov, false, 0)
@@ -271,16 +288,9 @@ end
 
 -- ════════════════════════════════════════════════════════
 -- ORBIT CAMERA
+-- (state variables hoisted to the top of the file so earlier functions
+--  like CreateCaptureCamera can read them)
 -- ════════════════════════════════════════════════════════
-
-local orbitCam      = nil
-local orbitAngleH   = 0.0
-local orbitDist     = 1.2
-local orbitCenter   = vector3(0.0, 0.0, 0.0)
-local orbitFov      = 40.0
-local orbitBaseDist = 1.2
-local orbitRoll     = 0.0
-local orbitCamZ     = 0.0   -- camera Z offset (center stays fixed, camera moves up/down)
 
 local function UpdateOrbitCamera()
     if not orbitCam then return end
@@ -327,9 +337,17 @@ local function CreateOrbitCamera(ped, presetName)
     orbitBaseDist = preset.dist or 1.2
     orbitDist     = orbitBaseDist
     orbitFov      = preset.fov
-    orbitAngleH   = math.rad(GetEntityHeading(ped))
-    orbitCamZ     = 0.0
-    orbitRoll     = 0.0
+    -- Match SetOrbitPreset: honor preset's defaultAngleH so the camera lands in
+    -- front of the ped on entry. Falling back to GetEntityHeading + 180 keeps
+    -- presets without an explicit angle on the ped's face side too — orbit math
+    -- subtracts cos, so naked heading would put us behind the ped.
+    if preset.defaultAngleH then
+        orbitAngleH = math.rad(preset.defaultAngleH)
+    else
+        orbitAngleH = math.rad((GetEntityHeading(ped) + 180.0) % 360.0)
+    end
+    orbitCamZ     = preset.defaultCamZ or 0.0
+    orbitRoll     = preset.defaultRoll or 0.0
 
     local camX = orbitCenter.x + orbitDist * math.sin(orbitAngleH)
     local camY = orbitCenter.y - orbitDist * math.cos(orbitAngleH)
@@ -418,32 +436,38 @@ end
 
 local function CaptureAndUpload(filename)
     ForceHighQuality()
-    local done = false
+
     local encoding = Customize.ScreenshotFormat or 'png'
     if Customize.TransparentBg then encoding = 'png' end
 
-    local opts = {
-        encoding = encoding,
-        headers  = {
-            ['X-Filename']    = filename,
-            ['X-Format']      = Customize.ScreenshotFormat or 'png',
-            ['X-Transparent'] = Customize.TransparentBg and '1' or '0',
-            ['X-ChromaKey']   = Customize.ChromaKeyColor or 'green',
-            ['X-Width']       = tostring(Customize.ScreenshotWidth or 0),
-            ['X-Height']      = tostring(Customize.ScreenshotHeight or 0),
-        },
-    }
+    local opts = { encoding = encoding }
     if encoding ~= 'png' then
         opts.quality = Customize.ScreenshotQuality
     end
 
-    exports['screenshot-basic']:requestScreenshotUpload(
-        Customize.BackendURL, 'files[]', opts,
-        function() done = true end
-    )
+    local done, base64 = false, nil
+    exports['screenshot-basic']:requestScreenshot(opts, function(data)
+        base64 = data
+        done = true
+    end)
 
     local timeout = GetGameTimer() + 10000
     while not done and GetGameTimer() < timeout do Wait(50) end
+
+    if not base64 or base64 == '' then
+        print('^3[uz_AutoShot]^0 Capture skipped (' .. filename .. '): empty screenshot')
+        return
+    end
+
+    TriggerLatentServerEvent('uz_autoshot:server:processCapture', Customize.LatentRate or 8000000, {
+        filename    = filename,
+        format      = Customize.ScreenshotFormat or 'png',
+        transparent = Customize.TransparentBg and true or false,
+        chromaKey   = Customize.ChromaKeyColor or 'green',
+        width       = Customize.ScreenshotWidth or 0,
+        height      = Customize.ScreenshotHeight or 0,
+        imageData   = base64,
+    })
 end
 
 local function SendProgress(current, total, category)
@@ -520,11 +544,32 @@ local function RestoreFullAppearance()
 
     local ped = PlayerPedId()
 
+    -- Pre-stream the world at the restore coords. Studio sat at -150z in a
+    -- separate routing bucket, so the original location's collision/IPLs were
+    -- unloaded; without an explicit wait the player drops through unloaded
+    -- ground the moment we re-enable collision.
     if pedAppearance.coords then
-        SetEntityCoordsNoOffset(ped, pedAppearance.coords.x, pedAppearance.coords.y, pedAppearance.coords.z, false, false, false)
-    end
-    if pedAppearance.heading then
-        SetEntityHeading(ped, pedAppearance.heading)
+        local x, y, z = pedAppearance.coords.x, pedAppearance.coords.y, pedAppearance.coords.z
+
+        FreezeEntityPosition(ped, true)
+        SetEntityCollision(ped, false, false)
+        SetEntityCoordsNoOffset(ped, x, y, z, false, false, false)
+        if pedAppearance.heading then
+            SetEntityHeading(ped, pedAppearance.heading)
+        end
+
+        SetFocusPosAndVel(x, y, z, 0.0, 0.0, 0.0)
+        RequestCollisionAtCoord(x, y, z)
+        NewLoadSceneStart(x, y, z, 100.0, 0)
+
+        local timeout = GetGameTimer() + 5000
+        while not HasCollisionLoadedAroundEntity(ped) and GetGameTimer() < timeout do
+            RequestCollisionAtCoord(x, y, z)
+            Wait(0)
+        end
+
+        if IsNewLoadSceneActive() then NewLoadSceneStop() end
+        ClearFocus()
     end
 
     if pedAppearance.headBlend then
@@ -551,12 +596,12 @@ local function RestoreFullAppearance()
         end
     end
 
+    SetEntityCollision(ped, true, true)
     FreezeEntityPosition(ped, false)
     ClearPedTasksImmediately(ped)
     Wait(100)
     ClearPedTasks(ped)
     SetPlayerControl(PlayerId(), true, 0)
-    SetEntityCollision(ped, true, true)
 end
 
 -- ════════════════════════════════════════════════════════
@@ -727,9 +772,13 @@ local function SetupCategoryCamera(ped, cameraName)
 end
 
 local function ReapplyRotation(ped, preset, hasSaved)
-    if not hasSaved then
-        SetEntityRotation(ped, preset.rotation.x, preset.rotation.y, preset.rotation.z + captureRotOffset, 2, false)
-    end
+    -- Only legacy presets without defaultAngleH need the ped rotated so the
+    -- behind-the-back camera math frames the front. Modern (defaultAngleH)
+    -- presets and the saved branch keep the ped at studio heading and let
+    -- the orbit-positioned camera frame the shot — rotating here would flip
+    -- the ped 180° relative to the preview the user just confirmed.
+    if hasSaved or preset.defaultAngleH then return end
+    SetEntityRotation(ped, preset.rotation.x, preset.rotation.y, preset.rotation.z + captureRotOffset, 2, false)
 end
 
 local function CaptureComponents(ped, gender, selectedSet)
@@ -1316,13 +1365,31 @@ local function DrawHeadChromaMask(ped)
     if not hideHeadActive then return end
     local gs = Customize.GreenScreen
     local r, g, b = gs.color.r, gs.color.g, gs.color.b
+    local hm = Customize.HeadMask or {}
 
     local headBone = GetPedBoneCoords(ped, 31086, 0.0, 0.0, 0.0) -- SKEL_Head
-    DrawMarker(28, headBone.x, headBone.y, headBone.z + 0.12,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.25, 0.25, 0.25,
-        r, g, b, 255,
-        false, false, 2, false, nil, nil, false)
+
+    local function drawSphere(m)
+        DrawMarker(28,
+            headBone.x + (m.offsetX or 0.0),
+            headBone.y + (m.offsetY or 0.0),
+            headBone.z + (m.offsetZ or 0.138),
+            0.0, 0.0, 0.0,
+            m.rotX or 0.0, m.rotY or 0.0, m.rotZ or 0.0,
+            m.sizeX or 0.12, m.sizeY or 0.15, m.sizeZ or 0.31,
+            r, g, b, 255,
+            false, false, 2, false, nil, nil, false)
+    end
+
+    -- HeadMask can be either a single mask table (legacy) or an array of
+    -- mask tables (e.g. one for the head + one for the neck/jaw). The array
+    -- form lets users stack multiple spheres so they can mask the head and
+    -- the neck independently without one shape clipping clothing.
+    if hm[1] then
+        for _, m in ipairs(hm) do drawSphere(m) end
+    else
+        drawSphere(hm)
+    end
 end
 
 -- ════════════════════════════════════════════════════════
@@ -2009,19 +2076,8 @@ exports('getShotsBaseURL', function()
     return 'https://cfx-nui-uz_AutoShot/shots'
 end)
 
-exports('getManifestURL', function(gender, itemType, id)
-    local base = 'http://127.0.0.1:3959/api/manifest'
-    if not gender then return base end
-    if not itemType then return base .. '/' .. gender end
-    return ('%s/%s/%s/%d'):format(base, gender, itemType, id)
-end)
-
 exports('getPhotoFormat', function()
     return Customize.ScreenshotFormat
-end)
-
-exports('getServerPort', function()
-    return 3959
 end)
 
 exports('getVehiclePhotoURL', function(modelName)
@@ -2038,7 +2094,14 @@ end)
 
 CreateThread(function()
     while true do
-        Wait(0)
+        -- Polling input every frame only matters when one of these states is
+        -- live; otherwise sleep so the script costs ~nothing in resmon while
+        -- idle. 500ms wake-up is well below the studio + bucket setup that
+        -- follows /shotmaker, so user-perceptible activation lag is unchanged.
+        -- Paused captures fall through here too — no input expected, sleep.
+        local pollInput = isBrowsing or isPreview or (isCapturing and not isPaused)
+        Wait(pollInput and 0 or 500)
+
         if isBrowsing then
             DisableControlAction(0, 1, true)
             DisableControlAction(0, 2, true)
