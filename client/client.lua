@@ -138,11 +138,6 @@ local function CreateCaptureCamera(entity, preset, presetName)
         lookZ = pedPos.z + zP
         roll  = saved.roll or 0.0
     elseif preset.defaultAngleH then
-        -- Mirror the saved branch using the live orbit state. Reading
-        -- orbitAngleH/Dist/Fov here keeps "Start without saving" framed
-        -- exactly like the preview the user just left, instead of snapping
-        -- back to preset.defaultAngleH (which would 180-flip whenever the
-        -- user had rotated the orbit to face the ped).
         local dist = (orbitDist > 0 and orbitDist) or preset.dist or 1.2
         local aH   = orbitAngleH
         local cZ   = orbitCamZ or preset.defaultCamZ or 0.0
@@ -153,8 +148,6 @@ local function CreateCaptureCamera(entity, preset, presetName)
         lookZ = pedPos.z + preset.zPos
         roll  = orbitRoll or preset.defaultRoll or 0.0
     else
-        -- Legacy preset without defaultAngleH: rotate ped to align with
-        -- camera, then place camera behind ped's forward vector.
         local rotZ = preset.rotation.z + captureRotOffset
         SetEntityRotation(ped, preset.rotation.x, preset.rotation.y, rotZ, 2, false)
         Wait(50)
@@ -288,8 +281,6 @@ end
 
 -- ════════════════════════════════════════════════════════
 -- ORBIT CAMERA
--- (state variables hoisted to the top of the file so earlier functions
---  like CreateCaptureCamera can read them)
 -- ════════════════════════════════════════════════════════
 
 local function UpdateOrbitCamera()
@@ -337,10 +328,6 @@ local function CreateOrbitCamera(ped, presetName)
     orbitBaseDist = preset.dist or 1.2
     orbitDist     = orbitBaseDist
     orbitFov      = preset.fov
-    -- Match SetOrbitPreset: honor preset's defaultAngleH so the camera lands in
-    -- front of the ped on entry. Falling back to GetEntityHeading + 180 keeps
-    -- presets without an explicit angle on the ped's face side too — orbit math
-    -- subtracts cos, so naked heading would put us behind the ped.
     if preset.defaultAngleH then
         orbitAngleH = math.rad(preset.defaultAngleH)
     else
@@ -378,16 +365,13 @@ local function ForceHighQuality()
 end
 
 local function WaitForClothingLoaded(ped, componentId, drawableId, textureId)
-    -- Preload texture
     SetPedPreloadVariationData(ped, componentId, drawableId, textureId)
     local timeout = GetGameTimer() + 800
     while not HasPedPreloadVariationDataFinished(ped) and GetGameTimer() < timeout do
         Wait(0)
     end
-    -- Apply
     SetPedComponentVariation(ped, componentId, drawableId, textureId, 0)
     ReleasePedPreloadVariationData(ped)
-    -- Force HD + 2 render frames
     ForceHighQuality()
     SetEntityLodDist(ped, 10000)
     Wait(0)
@@ -460,13 +444,18 @@ local function CaptureAndUpload(filename)
     end
 
     TriggerLatentServerEvent('uz_autoshot:server:processCapture', Customize.LatentRate or 8000000, {
-        filename    = filename,
-        format      = Customize.ScreenshotFormat or 'png',
-        transparent = Customize.TransparentBg and true or false,
-        chromaKey   = Customize.ChromaKeyColor or 'green',
-        width       = Customize.ScreenshotWidth or 0,
-        height      = Customize.ScreenshotHeight or 0,
-        imageData   = base64,
+        filename          = filename,
+        format            = Customize.ScreenshotFormat or 'png',
+        transparent       = Customize.TransparentBg and true or false,
+        chromaKey         = Customize.ChromaKeyColor or 'green',
+        width             = Customize.ScreenshotWidth or 0,
+        height            = Customize.ScreenshotHeight or 0,
+        -- Auto-crop: trim empty space around subject then fit-to-contain on canvas
+        autoCrop          = Customize.AutoCrop and true or false,
+        autoCropPadding   = Customize.AutoCropPadding or 8,
+        autoCropThreshold = Customize.AutoCropThreshold or 10,
+        autoCropMode      = Customize.AutoCropMode or 'alpha',
+        imageData         = base64,
     })
 end
 
@@ -544,10 +533,6 @@ local function RestoreFullAppearance()
 
     local ped = PlayerPedId()
 
-    -- Pre-stream the world at the restore coords. Studio sat at -150z in a
-    -- separate routing bucket, so the original location's collision/IPLs were
-    -- unloaded; without an explicit wait the player drops through unloaded
-    -- ground the moment we re-enable collision.
     if pedAppearance.coords then
         local x, y, z = pedAppearance.coords.x, pedAppearance.coords.y, pedAppearance.coords.z
 
@@ -663,7 +648,6 @@ local function SpawnStudioVehicle(modelName)
 
     local sx, sy, sz = Customize.StudioCoords.x, Customize.StudioCoords.y, Customize.StudioCoords.z
 
-    -- Spawn at player position first (FiveM streams here), then teleport
     local playerPos = GetEntityCoords(PlayerPedId())
     local veh = CreateVehicle(hash, playerPos.x, playerPos.y, playerPos.z, Customize.StudioHeading, false, false)
     if not DoesEntityExist(veh) then return nil end
@@ -673,7 +657,6 @@ local function SpawnStudioVehicle(modelName)
     SetEntityCollision(veh, false, false)
     FreezeEntityPosition(veh, true)
 
-    -- Teleport to studio — raise slightly so wheels don't clip, then hard freeze
     SetEntityCoordsNoOffset(veh, sx, sy, sz + 1.0, false, false, false)
     SetEntityHeading(veh, Customize.StudioHeading)
     FreezeEntityPosition(veh, true)
@@ -703,7 +686,6 @@ local function SpawnStudioObject(modelName)
     SetEntityCollision(obj, false, false)
     FreezeEntityPosition(obj, true)
 
-    -- Teleport to studio — fixed ground level
     SetEntityCoordsNoOffset(obj, sx, sy, sz, false, false, false)
     PlaceObjectOnGroundProperly(obj)
     FreezeEntityPosition(obj, true)
@@ -719,7 +701,6 @@ local function DeleteStudioEntity()
         if DoesEntityExist(ent) then
             SetEntityAsMissionEntity(ent, true, true)
             DeleteEntity(ent)
-            -- Fallback if still exists
             if DoesEntityExist(ent) then
                 SetEntityAsNoLongerNeeded(ent)
                 DeleteEntity(ent)
@@ -772,11 +753,6 @@ local function SetupCategoryCamera(ped, cameraName)
 end
 
 local function ReapplyRotation(ped, preset, hasSaved)
-    -- Only legacy presets without defaultAngleH need the ped rotated so the
-    -- behind-the-back camera math frames the front. Modern (defaultAngleH)
-    -- presets and the saved branch keep the ped at studio heading and let
-    -- the orbit-positioned camera frame the shot — rotating here would flip
-    -- the ped 180° relative to the preview the user just confirmed.
     if hasSaved or preset.defaultAngleH then return end
     SetEntityRotation(ped, preset.rotation.x, preset.rotation.y, preset.rotation.z + captureRotOffset, 2, false)
 end
@@ -886,7 +862,6 @@ local function CaptureProps(ped, gender, selectedSet)
     end
 end
 
--- Helper: apply overlay with correct color from config
 local function ApplyOverlayWithColor(ped, overlayIndex, variationId)
     SetPedHeadOverlay(ped, overlayIndex, variationId, 1.0)
     for _, cat in ipairs(Customize.OverlayCategories or {}) do
@@ -896,10 +871,6 @@ local function ApplyOverlayWithColor(ped, overlayIndex, variationId)
         end
     end
 end
-
--- ════════════════════════════════════════════════════════
--- OVERLAY CAPTURE LOOP
--- ════════════════════════════════════════════════════════
 
 local function CaptureOverlays(ped, gender, selectedSet)
     local cats = Customize.OverlayCategories or {}
@@ -918,7 +889,6 @@ local function CaptureOverlays(ped, gender, selectedSet)
         ResetPedForCategory(ped, cat.visibleComponents, cat.componentOverrides)
         hideHeadActive = false
 
-        -- Clear all overlays first so only the target overlay is visible
         for i = 0, 12 do SetPedHeadOverlay(ped, i, 255, 1.0) end
 
         local preset, hasSaved = SetupCategoryCamera(ped, cat.camera)
@@ -946,12 +916,7 @@ local function CaptureOverlays(ped, gender, selectedSet)
     end
 end
 
--- ════════════════════════════════════════════════════════
--- VEHICLE CAPTURE LOOP
--- ════════════════════════════════════════════════════════
-
 local function CaptureVehicles(selectedModelSet)
-    -- selectedModelSet contains individual model names: { ["adder"] = true, ["zentorno"] = true }
     local totalItems, captured = 0, 0
     local modelsToCapture = {}
 
@@ -972,8 +937,6 @@ local function CaptureVehicles(selectedModelSet)
 
         Wait(500)
 
-        -- Verify entity position and create camera pointing at it
-        local entityPos = GetEntityCoords(veh)
         local preset = Customize.CameraPresets['vehicle']
         DestroyCamera()
         captureCamera = CreateCaptureCamera(veh, preset, 'vehicle')
@@ -991,10 +954,6 @@ local function CaptureVehicles(selectedModelSet)
         ::nextVeh::
     end
 end
-
--- ════════════════════════════════════════════════════════
--- OBJECT CAPTURE LOOP
--- ════════════════════════════════════════════════════════
 
 local function CaptureObjects(selectedSet)
     local cats = Customize.ObjectCategories or {}
@@ -1197,7 +1156,6 @@ local function BuildCategoryList(includeDrawables)
         if includeDrawables then entry.drawables = GetPedHeadOverlayNum(cat.overlayIndex) end
         categories[#categories + 1] = entry
     end
-    -- Group vehicles by class
     local vehCats = GetVehicleCategories()
     local classGroups = {}
     local classOrder = {}
@@ -1250,7 +1208,6 @@ local function EnterCapturePreview()
     SetNuiFocus(true, true)
 end
 
--- Full reset between capture phases — destroys everything, restores clean state
 local function ResetCapturePhase()
     DestroyCamera()
     DeleteStudioEntity()
@@ -1261,7 +1218,6 @@ local function ResetCapturePhase()
     Wait(200)
 end
 
--- Setup studio for vehicle/object capture phase
 local function SetupEntityCapturePhase(mode)
     ResetCapturePhase()
     captureMode = mode
@@ -1302,7 +1258,6 @@ local function RunCapture(selectedComponents, selectedProps, selectedVehicles, s
     SetNuiFocus(false, false)
     Wait(300)
 
-    -- ── Phase 1: Clothing + Ped Props + Overlays ──
     if hasPed and not isCancelled then
         captureMode = 'clothing'
         local ped = PlayerPedId()
@@ -1311,13 +1266,11 @@ local function RunCapture(selectedComponents, selectedProps, selectedVehicles, s
         if not isCancelled then CaptureOverlays(ped, captureGender, overlaySet) end
     end
 
-    -- ── Phase 2: Vehicles ──
     if hasVeh and not isCancelled then
         SetupEntityCapturePhase('vehicle')
         CaptureVehicles(vehSet)
     end
 
-    -- ── Phase 3: Objects ──
     if hasObj and not isCancelled then
         SetupEntityCapturePhase('object')
         CaptureObjects(objSet)
@@ -1367,7 +1320,7 @@ local function DrawHeadChromaMask(ped)
     local r, g, b = gs.color.r, gs.color.g, gs.color.b
     local hm = Customize.HeadMask or {}
 
-    local headBone = GetPedBoneCoords(ped, 31086, 0.0, 0.0, 0.0) -- SKEL_Head
+    local headBone = GetPedBoneCoords(ped, 31086, 0.0, 0.0, 0.0)
 
     local function drawSphere(m)
         DrawMarker(28,
@@ -1381,10 +1334,6 @@ local function DrawHeadChromaMask(ped)
             false, false, 2, false, nil, nil, false)
     end
 
-    -- HeadMask can be either a single mask table (legacy) or an array of
-    -- mask tables (e.g. one for the head + one for the neck/jaw). The array
-    -- form lets users stack multiple spheres so they can mask the head and
-    -- the neck independently without one shape clipping clothing.
     if hm[1] then
         for _, m in ipairs(hm) do drawSphere(m) end
     else
@@ -1545,7 +1494,6 @@ RegisterNUICallback('applyClothing', function(data, cb)
         if data.drawable == -1 then ClearPedProp(ped, data.id)
         else SetPedPropIndex(ped, data.id, data.drawable, data.texture, true) end
     elseif data.itemType == 'overlay' then
-        -- Clear all overlays, then apply selected one with correct color
         for i = 0, 12 do SetPedHeadOverlay(ped, i, 255, 1.0) end
         ApplyOverlayWithColor(ped, data.id, data.drawable)
     elseif data.itemType == 'vehicle' and data.model then
@@ -1580,15 +1528,12 @@ RegisterNUICallback('setCameraPreset', function(data, cb)
 
     if (isPreview or isBrowsing) and data.categoryType and data.categoryId ~= nil then
         if isEntityMode then
-            -- Must run in a thread because we need Wait() for model loading
-            -- Token prevents race conditions when switching quickly
             entitySpawnToken = entitySpawnToken + 1
             local myToken = entitySpawnToken
 
             CreateThread(function()
                 local ped = PlayerPedId()
 
-                -- Delete previous entity first
                 DeleteStudioEntity()
                 Wait(0)
                 if entitySpawnToken ~= myToken then return end
@@ -1598,7 +1543,6 @@ RegisterNUICallback('setCameraPreset', function(data, cb)
                 captureMode = data.categoryType
 
                 if data.categoryType == 'vehicle' then
-                    -- categoryId is class name; spawn first model of that class, or use firstModel if provided
                     local modelToSpawn = data.firstModel
                     if not modelToSpawn then
                         for _, cat in ipairs(GetVehicleCategories()) do
@@ -1617,7 +1561,6 @@ RegisterNUICallback('setCameraPreset', function(data, cb)
 
                 Wait(300)
                 if entitySpawnToken ~= myToken then
-                    -- A newer spawn request came in, delete what we just spawned
                     DeleteStudioEntity()
                     return
                 end
@@ -1641,7 +1584,6 @@ RegisterNUICallback('setCameraPreset', function(data, cb)
         else
             local ped = PlayerPedId()
 
-            -- Switching to clothing/prop preview
             if captureMode ~= 'clothing' then
                 DeleteStudioEntity()
                 SetEntityVisible(ped, true, false)
@@ -1685,11 +1627,9 @@ RegisterNUICallback('setCameraPreset', function(data, cb)
 
             hideHeadActive = shouldHideHead
             ResetPedForCategory(ped, visComps, compOverrides)
-            -- Always clear overlays when switching categories
             for i = 0, 12 do SetPedHeadOverlay(ped, i, 255, 1.0) end
 
             if data.categoryType == 'overlay' then
-                -- Show first variation as preview with correct color
                 ApplyOverlayWithColor(ped, data.categoryId, 0)
             elseif data.categoryType == 'component' then
                 SetPedComponentVariation(ped, data.categoryId, previewDraw, 0, 0)
@@ -1724,7 +1664,6 @@ end)
 RegisterNUICallback('saveCameraAngle', function(data, cb)
     local cam = data.camera or activePreviewCamera
     if cam and orbitCam then
-        -- Use entity coords as reference for vehicle/object, ped coords for clothing
         local refZ
         if captureMode ~= 'clothing' and spawnedEntity and DoesEntityExist(spawnedEntity) then
             refZ = GetEntityCoords(spawnedEntity).z
@@ -1905,7 +1844,6 @@ end)
 RegisterCommand(Customize.Command, function() EnterCapturePreview() end, Customize.AceRestricted)
 RegisterCommand(Customize.MenuCommand, function() OpenClothingMenu() end, Customize.AceRestricted)
 
--- Single vehicle capture command
 RegisterCommand('shotcar', function(_, args)
     if isCapturing or isPreview then return end
     if #args == 0 then
@@ -1962,7 +1900,6 @@ RegisterCommand('shotcar', function(_, args)
     end
 end, Customize.AceRestricted)
 
--- Single object capture command
 RegisterCommand('shotprop', function(_, args)
     if isCapturing or isPreview then return end
     if #args == 0 then
@@ -2019,7 +1956,6 @@ RegisterCommand('shotprop', function(_, args)
     end
 end, Customize.AceRestricted)
 
--- Single entity capture confirmation
 RegisterNUICallback('confirmSingleCapture', function(data, cb)
     cb('ok')
     if not isPreview or not spawnedEntity then return end
@@ -2094,11 +2030,6 @@ end)
 
 CreateThread(function()
     while true do
-        -- Polling input every frame only matters when one of these states is
-        -- live; otherwise sleep so the script costs ~nothing in resmon while
-        -- idle. 500ms wake-up is well below the studio + bucket setup that
-        -- follows /shotmaker, so user-perceptible activation lag is unchanged.
-        -- Paused captures fall through here too — no input expected, sleep.
         local pollInput = isBrowsing or isPreview or (isCapturing and not isPaused)
         Wait(pollInput and 0 or 500)
 
