@@ -12,6 +12,18 @@ Customize.TransparentBg     = true          -- chroma key removal (png only)
 Customize.ScreenshotWidth   = 512
 Customize.ScreenshotHeight  = 512
 
+-- Auto-Crop — trims empty space around the subject after chroma key removal,
+-- then scales the subject to fill the output canvas (fit-to-contain, centred).
+-- Requires TransparentBg = true and ScreenshotFormat = 'png'.
+-- Result: the clothing/vehicle/object fills ~90 %+ of the image instead of
+-- sitting in a sea of transparent pixels.
+Customize.AutoCrop          = true          -- enable automatic subject crop
+Customize.AutoCropPadding   = 8             -- px of breathing room added around the tight bbox
+Customize.AutoCropThreshold = 10            -- alpha threshold: pixels with alpha < this are "empty"
+Customize.AutoCropMode      = 'alpha'       -- 'alpha' (transparent bg only)
+                                            -- 'dark'  (dark/black bg, no alpha)
+                                            -- 'both'  (either condition counts as empty)
+
 Customize.StudioCoords      = vector3(0.0, 0.0, -150.0)
 Customize.StudioHeading     = 180.0
 
